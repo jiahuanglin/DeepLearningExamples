@@ -25,8 +25,13 @@ class BookscorpusTextFormatting:
     def merge(self):
         with open(self.output_filename, mode='w', newline='\n') as ofile:
             for filename in glob.glob(self.books_path + '/' + '*.txt', recursive=True):
-                with open(filename, mode='r', encoding='utf-8-sig', newline='\n') as file:
+                print("processing file: {}".format(filename))
+                with open(filename, mode='r', encoding='utf-8-sig', errors='ignore', newline='\n') as file:
                     for line in file:
                         if line.strip() != '':
-                            ofile.write(line.strip() + ' ')
+                            try:
+                                ofile.write(line.strip() + ' ')
+                            except UnicodeEncodeError as e:
+                                print("encoding this line: {}".format(line.encode('utf-8', 'ignore')))
+                                print("encoding has encountered exception: {}".format(e))
                 ofile.write("\n\n")

@@ -130,19 +130,28 @@ def bias_tanh(bias, y):
     x = bias + y
     return torch.tanh(x)
 
+def non_fused_bias_tanh(bias, y):
+    x = bias + y
+    return torch.tanh(x)
+
+def non_fused_bias_gelu(bias, y):
+    x = bias + y
+    return  x * 0.5 * (1.0 + torch.erf(x / 1.41421))
+
 def gelu(x):
     """Implementation of the gelu activation function.
         For information: OpenAI GPT's gelu is slightly different (and gives slightly different results):
         0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
         Also see https://arxiv.org/abs/1606.08415
     """
-    return f_gelu(x)
+    return  x * 0.5 * (1.0 + torch.erf(x / 1.41421))
+    # return f_gelu(x)
 
 def swish(x):
     return x * torch.sigmoid(x)
 
 
-ACT2FN = {"gelu": gelu, "relu": torch.nn.functional.relu, "swish": swish}
+ACT2FN = {"gelu": gelu, "relu": torch.nn.functional.relu, "swish": swish, "tanh": non_fused_bias_tanh}
 
 class LinearActivation(Module):
     r"""Fused Linear and activation Module.
@@ -155,6 +164,8 @@ class LinearActivation(Module):
         self.out_features = out_features
         self.fused_gelu = False
         self.fused_tanh = False
+
+        # self.act_fn = ACT2FN[act]
         if isinstance(act, str) or (sys.version_info[0] == 2 and isinstance(act, unicode)):
             if bias and act == 'gelu':
                 self.fused_gelu = True
@@ -164,6 +175,7 @@ class LinearActivation(Module):
                 self.act_fn = ACT2FN[act]
         else:
             self.act_fn = act
+
         self.weight = Parameter(torch.Tensor(out_features, in_features))
         if bias:
             self.bias = Parameter(torch.Tensor(out_features))
@@ -180,9 +192,11 @@ class LinearActivation(Module):
 
     def forward(self, input):
         if self.fused_gelu:
-            return bias_gelu(self.bias, F.linear(input, self.weight, None))
+            return non_fused_bias_gelu(self.bias, F.linear(input, self.weight, None))
+            # return bias_gelu(self.bias, F.linear(input, self.weight, None))
         elif self.fused_tanh:
-            return bias_tanh(self.bias, F.linear(input, self.weight, None))
+            return non_fused_bias_tanh(self.bias, F.linear(input, self.weight, None))
+            # return bias_tanh(self.bias, F.linear(input, self.weight, None))
         else:
             return self.act_fn(F.linear(input, self.weight, self.bias))
 

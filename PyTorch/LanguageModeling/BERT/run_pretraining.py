@@ -29,13 +29,16 @@ import argparse
 import random
 import h5py
 from tqdm import tqdm, trange
+from collections import defaultdict
 import os
 import numpy as np
+import pandas as pd
+
 import torch
+from torch.optim import Adam
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
 from torch.utils.data.distributed import DistributedSampler
 import math
-from apex import amp
 import multiprocessing
 
 from tokenization import BertTokenizer
@@ -43,13 +46,21 @@ from modeling import BertForPreTraining, BertConfig
 from optimization import BertLAMB
 
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from utils import is_main_process
-from apex.parallel import DistributedDataParallel as DDP
+from utils import is_main_process, Timers
 from schedulers import LinearWarmUpScheduler
-from apex.parallel.distributed import flat_dist_call
 import amp_C
 import apex_C
-from apex.amp import _amp_state
+
+try:
+    from apex.parallel import DistributedDataParallel as DDP
+    from apex.optimizers import FP16_Optimizer
+    from apex.optimizers import FusedAdam
+    from apex import amp
+    from apex.amp import _amp_state
+    from apex.parallel.distributed import flat_dist_call
+except ImportError:
+    raise ImportError(
+        "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
 
 from concurrent.futures import ProcessPoolExecutor
 
@@ -147,8 +158,8 @@ def parse_arguments():
                         type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument("--num_train_epochs",
-                        default=3.0,
-                        type=float,
+                        default=10,
+                        type=int,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--max_steps",
                         default=1000,
@@ -221,7 +232,49 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Whether to run training.")
+
+    # optimizer
+    parser.add_argument("--optimizer", 
+                        choices=['adam', 'fusedadam', 'lamb'],
+                        default='lamb',
+                        help="which optimizer to use")
+
+    # nvprof args
+    parser.add_argument('--nvprof', action='store_true',
+                        help='profile this program')
+    parser.add_argument('--profile_start', type=int, default=200,
+                        help="""Start iteration of nvidia profiler""")
+    parser.add_argument('--profile_stop', type=int, default=201,
+                        help="""Stop iteration of nvidia profiler""")
+
+
+    # benchmarking args
+    parser.add_argument('--benchmark', action='store_true',
+                        help='benchmark this program')
+    parser.add_argument('--log_interval', type=int, default=100,
+                        help="""log interval of benchmarking""")
+    parser.add_argument('--benchmark_dir', type=str, default="benchmark_output",
+                        help="""Dir to save benchmark output stats""")
+    parser.add_argument('--benchmark_start', type=int, default=1000,
+                        help="""Start iteration of nvidia profiler""")
+    parser.add_argument('--benchmark_stop', type=int, default=2000,
+                        help="""Stop iteration of nvidia profiler""")
+    parser.add_argument('--benchmark_partition', type=str, default="p100",
+                        help="""Partition of gpus""")
+
+
+    # distributed training parameters
+    parser.add_argument('--nproc_per_node', type=int, default=1,
+                        help="""Number of gpus in each node""")
+    parser.add_argument('--local_ddp', action='store_true', 
+                        help="""whether to wrap model in DDP locally""")
+
     args = parser.parse_args()
+
+    args.rank = int(os.getenv('RANK', '0'))
+    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    args.nodes = int(args.world_size / args.nproc_per_node)
+
     return args
 
 def setup_training(args):
@@ -235,19 +288,29 @@ def setup_training(args):
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
         args.n_gpu = 1
+
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+        init_method = 'tcp://'
+        master_ip = os.getenv('MASTER_ADDR', 'localhost')
+        master_port = os.getenv('MASTER_PORT', '6000')
+        init_method += master_ip + ':' + master_port
+        torch.distributed.init_process_group(
+            backend='nccl', 
+            world_size=args.world_size, 
+            rank=args.rank,
+            init_method=init_method
+        )
 
     logger.info("device %s n_gpu %d distributed training %r", device, args.n_gpu, bool(args.local_rank != -1))
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
             args.gradient_accumulation_steps))
-    if args.train_batch_size % args.gradient_accumulation_steps != 0:
-        raise ValueError("Invalid gradient_accumulation_steps parameter: {}, batch size {} should be divisible".format(
-            args.gradient_accumulation_steps, args.train_batch_size))
+    # if args.train_batch_size % args.gradient_accumulation_steps != 0:
+    #     raise ValueError("Invalid gradient_accumulation_steps parameter: {}, batch size {} should be divisible".format(
+    #         args.gradient_accumulation_steps, args.train_batch_size))
 
-    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+    # args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     if not args.do_train:
         raise ValueError(" `do_train`  must be True.")
@@ -304,10 +367,19 @@ def prepare_model_and_optimizer(args, device):
             optimizer_grouped_parameters.append({'params': [p], 'weight_decay': 0.00, 'name': n})
             names.append({'params': [n], 'weight_decay': 0.00})
 
-    optimizer = BertLAMB(optimizer_grouped_parameters,
-                         lr=args.learning_rate,
-                         warmup=args.warmup_proportion,
-                         t_total=args.max_steps)
+    if args.optimizer == 'lamb':
+        optimizer = BertLAMB(optimizer_grouped_parameters,
+                            lr=args.learning_rate,
+                            warmup=args.warmup_proportion,
+                            t_total=args.max_steps)
+    elif args.optimizer == 'fusedadam':
+        optimizer = FusedAdam(optimizer_grouped_parameters,
+                              lr=args.learning_rate,
+                              bias_correction=False)
+    else:
+        optimizer = Adam(optimizer_grouped_parameters, lr=args.learning_rate)
+
+
     if args.fp16:
 
         if args.loss_scale == 0:
@@ -346,7 +418,8 @@ def prepare_model_and_optimizer(args, device):
         else:
             flat_dist_call([param.data for param in model.parameters()], torch.distributed.broadcast, (0,) )
     elif args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.parallel.distributed.DistributedDataParallel(model)
+        # model = torch.nn.DataParallel(model)
 
     return model, optimizer, checkpoint, global_step
 
@@ -367,7 +440,8 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
         amp_C.multi_tensor_scale(65536,
             overflow_buf,
             [master_grads, allreduced_views],
-            scaler.loss_scale() / (torch.distributed.get_world_size() * args.gradient_accumulation_steps))
+            scaler.loss_scale() / torch.distributed.get_world_size())
+            # scaler.loss_scale() / (torch.distributed.get_world_size() * args.gradient_accumulation_steps))
         # 3. sum gradient across ranks. Because of the predivision, this averages the gradient
         torch.distributed.all_reduce(flat_raw)
         # 4. combine unscaling and unflattening of allreduced gradient
@@ -432,6 +506,7 @@ def main():
 
         model.train()
         most_recent_ckpts_paths = []
+        benchmark_stats = defaultdict(lambda: [])
         average_loss = 0.0  # averaged loss every args.log_freq steps
         epoch = 0
         training_steps = 0
@@ -460,8 +535,10 @@ def main():
             if torch.distributed.is_initialized() and torch.distributed.get_world_size() > num_files:
                 remainder = torch.distributed.get_world_size() % num_files
                 data_file = files[(f_start_id*torch.distributed.get_world_size()+torch.distributed.get_rank() + remainder*f_start_id)%num_files]
-            else:
+            elif torch.distributed.is_initialized():
                 data_file = files[(f_start_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
+            else:
+                data_file = files[f_start_id % num_files]
 
             previous_file = data_file
 
@@ -477,12 +554,12 @@ def main():
                 overflow_buf = torch.cuda.IntTensor([0])
 
             for f_id in range(f_start_id + 1 , len(files)):
-                
-   
-                if torch.distributed.get_world_size() > num_files:
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > num_files:
                     data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank() + remainder*f_id)%num_files]
-                else:
+                elif torch.distributed.is_initialized():
                     data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
+                else:
+                    data_file = files[f_start_id % num_files]
 
                 logger.info("file no %s file %s" % (f_id, previous_file))
 
@@ -492,8 +569,13 @@ def main():
 
                 train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
                 for step, batch in enumerate(train_iter):
-
                     training_steps += 1
+                    if training_steps == 1:
+                        start = time.time()
+                    else:
+                        elapsed = time.time() - start
+                        start = time.time()
+
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
                     loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask,
@@ -506,8 +588,18 @@ def main():
                     if args.gradient_accumulation_steps > 1:
                         if not args.allreduce_post_accumulation:
                             # this division was merged into predivision
-                            loss = loss / args.gradient_accumulation_steps
+                            # loss = loss / args.gradient_accumulation_steps
                             divisor = 1.0
+
+                        if args.local_rank != -1:
+                            if training_steps % args.gradient_accumulation_steps == 0:
+                                # we are using APEX DDP => enable_allreduce / disable_allreduce
+                                print("iteration {}, all reduce enabled!".format(training_steps))
+                                model.enable_allreduce()
+                            else:
+                                print("iteration {}, all reduce disabled!".format(training_steps))
+                                model.disable_allreduce()
+
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
                             scaled_loss.backward()
@@ -516,7 +608,11 @@ def main():
                     average_loss += loss.item()
 
                     if training_steps % args.gradient_accumulation_steps == 0:
+                        weight_update_start = time.time()
                         global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                        weight_update_time = time.time() - weight_update_start
+                        benchmark_stats['weight_update_time'].append(weight_update_time)
+                        print("weight_update_time (ms): {}".format(weight_update_time * 1000))
 
                     if global_step >= args.max_steps:
                         last_num_steps = int(training_steps / args.gradient_accumulation_steps) % args.log_freq
@@ -530,16 +626,27 @@ def main():
                             logger.info("Total Steps:{} Final Loss = {}".format(training_steps, average_loss.item()))
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
-                            print("Step:{} Average Loss = {} Step Loss = {} LR {}".format(global_step, average_loss / (
-                                        args.log_freq * divisor),
-                                                                                            loss.item() * args.gradient_accumulation_steps / divisor,
-                                                                                            optimizer.param_groups[0][
-                                                                                                'lr']))
+                            print("Step:{} Average Loss = {} Step Loss = {} LR {}".format(
+                                global_step, 
+                                average_loss / (args.log_freq * divisor),
+                                loss.item() * args.gradient_accumulation_steps / divisor,
+                                optimizer.param_groups[0]['lr']))
                         average_loss = 0
+
+                    if args.benchmark and (training_steps % args.log_interval == 0) and is_main_process():
+                        # print("main process log interval satisfied, training step {}".format(training_steps))
+                        if args.benchmark_start < training_steps <= args.benchmark_stop:
+                            benchmark_stats['iteration'].append(training_steps)
+                            benchmark_stats['seq_length'].append(args.max_seq_length)
+                            benchmark_stats['batch_size'].append(args.train_batch_size * args.world_size)
+                            benchmark_stats['num_tokens'].append(args.max_seq_length * args.train_batch_size * args.world_size)
+                            benchmark_stats['elapsed_time'].append(elapsed * args.log_interval)
+                            benchmark_stats['log_interval'].append(args.log_interval)
 
                     if global_step >= args.max_steps or training_steps % (
                             args.num_steps_per_checkpoint * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
+                            print("total iteration time used: {}".format(time.time() - start))
                             # Save a trained model
                             logger.info("** ** * Saving fine - tuned model ** ** * ")
                             model_to_save = model.module if hasattr(model,
@@ -562,6 +669,40 @@ def main():
                         if global_step >= args.max_steps:
                             del train_dataloader
                             # thread.join()
+                            if args.benchmark and is_main_process():
+                                benchmark_csv = {
+                                    k: [np.mean(l)] for k,l in benchmark_stats.items()
+                                }
+                                print(benchmark_csv)
+                                benchmark_csv['weight_update_time'] = args.log_interval * np.array(benchmark_csv['weight_update_time'])
+                                benchmark_csv['token_throughput'] = np.array(benchmark_csv['num_tokens']) * np.array(benchmark_csv['log_interval']) / np.array(benchmark_csv['elapsed_time'])
+                                benchmark_csv['precision'] = [ 'fp16' if args.fp16 else 'fp32' ]
+                                benchmark_csv['gradient_accumulation'] = args.gradient_accumulation_steps
+                                benchmark_csv['optimizer'] = args.optimizer,
+                                benchmark_csv['world_size'] = args.world_size,
+                                benchmark_csv['num_nodes'] = args.nodes
+
+                                save_dir = os.path.join(
+                                    args.benchmark_dir, 
+                                    "{gpus}_gpus_{partition}_trials".format(
+                                        gpus=args.world_size,
+                                        partition=args.benchmark_partition
+                                    )
+                                )
+                                if not os.path.exists(save_dir):
+                                    os.mkdir(save_dir)
+                                df = pd.DataFrame.from_dict(benchmark_csv)
+                                df.to_csv(os.path.join(
+                                    save_dir,
+                                    "nvidia_benchmark_{nodes}_nodes_{partition}_batch_size_{batch_size}_seq_len_{seq_len}_{precision}_grad_acc_{gradient_accumulation}.csv".format(
+                                        nodes=args.nodes,
+                                        partition=args.benchmark_partition,
+                                        batch_size=args.train_batch_size,
+                                        seq_len=args.max_seq_length,
+                                        precision='fp16' if args.fp16 else 'fp32',
+                                        gradient_accumulation=args.gradient_accumulation_steps
+                                    )
+                                ))
                             return args
 
                 del train_dataloader

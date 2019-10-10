@@ -26,11 +26,11 @@ class WikicorpusTextFormatting:
         with open(self.output_filename, mode='w', newline='\n') as ofile:
             for dirname in glob.glob(self.wiki_path + '/*/', recursive=False):
                 for filename in glob.glob(dirname + 'wiki_*', recursive=self.recursive):
-                    print(filename)
+                    print("processing: {}".format(filename))
                     article_lines = []
                     article_open = False
 
-                    with open(filename, mode='r', newline='\n') as file:
+                    with open(filename, mode='r', encoding='utf-8-sig', newline='\n') as file:
                         for line in file:
                             if '<doc id=' in line:
                                 article_open = True
@@ -38,7 +38,11 @@ class WikicorpusTextFormatting:
                                 article_open = False
                                 for oline in article_lines[1:]:
                                     if oline != '\n':
-                                        ofile.write(oline.rstrip() + " ")
+                                        try:
+                                            ofile.write(oline.rstrip() + ' ')
+                                        except UnicodeEncodeError as e:
+                                            print("encoding this line: {}".format(line.encode('utf-8', 'ignore')))
+                                            print("encoding has encountered exception: {}".format(e))
                                 ofile.write("\n\n")
                                 article_lines = []
                             else:

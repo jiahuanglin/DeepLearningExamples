@@ -77,11 +77,12 @@ def main(args):
 
         elif args.dataset == 'wikicorpus_en':
             if args.skip_wikiextractor == 0:
-                path_to_wikiextractor_in_container = '/workspace/wikiextractor/WikiExtractor.py'
+                path_to_wikiextractor_in_container = '/h/jacoblin/github/wikiextractor/WikiExtractor.py'
                 wikiextractor_command = path_to_wikiextractor_in_container + ' ' + directory_structure['download'] + '/' + args.dataset + '/wikicorpus_en.xml ' + '-b 100M --processes ' + str(args.n_processes) + ' -o ' + directory_structure['extracted'] + '/' + args.dataset
+                wikiextractor_command = "python3 " + wikiextractor_command
                 print('WikiExtractor Command:', wikiextractor_command)
-                wikiextractor_process = subprocess.run(wikiextractor_command, shell=True, check=True)
-                #wikiextractor_process.communicate()
+                wikiextractor_process = subprocess.run(wikiextractor_command, check=True)
+                wikiextractor_process.communicate()
 
             wiki_path = directory_structure['extracted'] + '/wikicorpus_en'
             output_filename = directory_structure['formatted'] + '/wikicorpus_en_one_article_per_line.txt'
@@ -91,8 +92,9 @@ def main(args):
         elif args.dataset == 'wikicorpus_zh':
             assert False, 'wikicorpus_zh not fully supported at this time. The simplified/tradition Chinese data needs to be translated and properly segmented still, and should work once this step is added.'
             if args.skip_wikiextractor == 0:
-                path_to_wikiextractor_in_container = '/workspace/wikiextractor/WikiExtractor.py'
+                path_to_wikiextractor_in_container = '/h/jacoblin/github/wikiextractor/WikiExtractor.py'
                 wikiextractor_command = path_to_wikiextractor_in_container + ' ' + directory_structure['download'] + '/' + args.dataset + '/wikicorpus_zh.xml ' + '-b 100M --processes ' + str(args.n_processes) + ' -o ' + directory_structure['extracted'] + '/' + args.dataset
+                wikiextractor_command = "python3 " + wikiextractor_command
                 print('WikiExtractor Command:', wikiextractor_command)
                 wikiextractor_process = subprocess.run(wikiextractor_command, shell=True, check=True)
                 #wikiextractor_process.communicate()
@@ -147,7 +149,7 @@ def main(args):
             os.makedirs(directory_structure['tfrecord'] + "/" + args.dataset)
 
         def create_record_worker(filename_prefix, shard_id, output_format='tfrecord'):
-            bert_preprocessing_command = 'python /workspace/bert/create_pretraining_data.py'
+            bert_preprocessing_command = 'python create_pretraining_data.py'
             bert_preprocessing_command += ' --input_file=' + directory_structure['sharded'] + '/' + args.dataset + '/' + filename_prefix + '_' + str(shard_id) + '.txt'
             bert_preprocessing_command += ' --output_file=' + directory_structure['tfrecord'] + '/' + args.dataset + '/' + filename_prefix + '_' + str(shard_id) + '.' + output_format
             bert_preprocessing_command += ' --vocab_file=' + args.vocab_file
@@ -187,7 +189,7 @@ def main(args):
             os.makedirs(directory_structure['hdf5'] + "/" + args.dataset)
 
         def create_record_worker(filename_prefix, shard_id, output_format='hdf5'):
-            bert_preprocessing_command = 'python /workspace/bert/create_pretraining_data.py'
+            bert_preprocessing_command = 'python create_pretraining_data.py'
             bert_preprocessing_command += ' --input_file=' + directory_structure['sharded'] + '/' + args.dataset + '/' + filename_prefix + '_' + str(shard_id) + '.txt'
             bert_preprocessing_command += ' --output_file=' + directory_structure['hdf5'] + '/' + args.dataset + '/' + filename_prefix + '_' + str(shard_id) + '.' + output_format
             bert_preprocessing_command += ' --vocab_file=' + args.vocab_file
@@ -296,7 +298,7 @@ if __name__ == "__main__":
         '--n_processes',
         type=int,
         help='Specify the max number of processes to allow at one time',
-        default=4
+        default=20
     )
 
     parser.add_argument(
@@ -351,7 +353,7 @@ if __name__ == "__main__":
         '--skip_wikiextractor',
         type=int,
         help='Specify whether to skip wikiextractor step 0=False, 1=True',
-        default=0
+        default=1
     )
 
     parser.add_argument(
