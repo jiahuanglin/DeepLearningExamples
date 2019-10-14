@@ -1,0 +1,2 @@
+,weight_update_time,iteration,seq_length,batch_size,num_tokens,elapsed_time,log_interval,token_throughput,precision,optimizer,gradient_accumulation,world_size,num_nodes
+0,2.1161026500520252,1550.0,128.0,64.0,8192.0,140.37461757659912,100.0,5835.812870891576,fp16,lamb,1,2,2

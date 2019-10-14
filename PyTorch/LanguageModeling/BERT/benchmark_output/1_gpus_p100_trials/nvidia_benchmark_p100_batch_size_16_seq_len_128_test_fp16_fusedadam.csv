@@ -1,0 +1,2 @@
+,weight_update_time,iteration,seq_length,batch_size,num_tokens,elapsed_time,log_interval,token_throughput,precision,optimizer
+0,1.084407885869344,1550.0,128.0,16.0,2048.0,129.79032571315764,100.0,1577.9296251449207,fp16,fusedadam

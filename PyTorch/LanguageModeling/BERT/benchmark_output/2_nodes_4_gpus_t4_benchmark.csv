@@ -1,0 +1,4 @@
+﻿Unnamed: 0,weight_update_time,iteration,seq_length,batch_size,num_tokens,elapsed_time,log_interval,token_throughput,precision,gradient_accumulation,optimizer,world_size,num_nodes
+0,1.0344927878606889,1550.0,128.0,128.0,16384.0,71.10403776168823,100.0,23042.29199319523,fp16,2,fusedadam,4,2
+0,1.079204343614124,1550.0,128.0,128.0,16384.0,156.24956607818604,100.0,10485.78912008087,fp16,1,fusedadam,4,4
+0,1.0580050491151356,1550.0,128.0,64.0,8192.0,133.40643644332886,100.0,6140.633254588108,fp16,1,fusedadam,4,2

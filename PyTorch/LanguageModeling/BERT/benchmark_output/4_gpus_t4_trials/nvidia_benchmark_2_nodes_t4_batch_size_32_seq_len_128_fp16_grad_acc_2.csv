@@ -1,0 +1,2 @@
+,weight_update_time,iteration,seq_length,batch_size,num_tokens,elapsed_time,log_interval,token_throughput,precision,gradient_accumulation,optimizer,world_size,num_nodes
+0,1.0344927878606887,1550.0,128.0,128.0,16384.0,71.10403776168823,100.0,23042.29199319523,fp16,2,fusedadam,4,2
